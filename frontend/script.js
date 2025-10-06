@@ -2,6 +2,7 @@ const chatEl = document.getElementById('chat');
 const formEl = document.getElementById('composer');
 const inputEl = document.getElementById('input');
 const modelEl = document.getElementById('model');
+const useDbEl = document.getElementById('use-db');
 let models = [];
 // Keep separate histories per model id
 const modelIdToMessages = {};
@@ -38,9 +39,15 @@ async function sendMessage(text) {
   render();
   inputEl.value = '';
   inputEl.disabled = true;
+  // Show thinking placeholder
+  const placeholder = { role: 'assistant', content: '…' };
+  msgs.push(placeholder);
+  render();
 
   try {
     const selected = models.find(m => m.id === modelEl.value) || { provider: 'ollama', id: 'llama3.2' };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
     const res = await fetch('http://127.0.0.1:8000/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -48,16 +55,32 @@ async function sendMessage(text) {
         model: selected.id,
         provider: selected.provider,
         messages: msgs,
+        use_database: !!useDbEl?.checked,
       }),
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const assistantMsg = data.message || { role: 'assistant', content: '' };
     // Some servers return role separately; ensure shape
     if (!assistantMsg.role) assistantMsg.role = 'assistant';
-    msgs.push(assistantMsg);
+    // Replace placeholder with real response
+    const idx = msgs.indexOf(placeholder);
+    if (idx !== -1) {
+      msgs.splice(idx, 1, assistantMsg);
+    } else {
+      msgs.push(assistantMsg);
+    }
   } catch (err) {
-    getMessages().push({ role: 'assistant', content: `Error: ${err.message}` });
+    // Replace placeholder with error
+    const idx = msgs.indexOf(placeholder);
+    const errMsg = { role: 'assistant', content: `Error: ${err.name === 'AbortError' ? 'Request timed out' : err.message}` };
+    if (idx !== -1) {
+      msgs.splice(idx, 1, errMsg);
+    } else {
+      msgs.push(errMsg);
+    }
   } finally {
     inputEl.disabled = false;
     render();

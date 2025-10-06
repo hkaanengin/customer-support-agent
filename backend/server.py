@@ -4,8 +4,17 @@ from fastapi.middleware.cors import CORSMiddleware
 import requests
 import os
 from dotenv import load_dotenv
-from routes.debug import router as debug_router
-from routes.test import router as test_router
+try:
+    # Running from repo root: uvicorn backend.server:app
+    from backend.routes.debug import router as debug_router  # type: ignore
+    from backend.routes.test import router as test_router  # type: ignore
+    from backend.routes.db import router as db_router  # type: ignore
+except Exception:
+    # Running from backend dir: uvicorn server:app
+    from routes.debug import router as debug_router  # type: ignore
+    from routes.test import router as test_router  # type: ignore
+    from routes.db import router as db_router  # type: ignore
+from routes.db import router as db_router
 
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
@@ -26,12 +35,24 @@ app.add_middleware(
 
 app.include_router(debug_router)
 app.include_router(test_router)
+app.include_router(db_router)
+app.include_router(db_router)
 
 @app.post("/chat")
 def chat(payload: Dict[str, Any]) -> Dict[str, Any]:
     model = payload.get("model", "llama3.2")
     messages: List[Dict[str, str]] = payload.get("messages", [])
     provider = payload.get("provider")  # optional explicit provider
+    use_database = bool(payload.get("use_database", True))
+
+    # Optional DB augmentation
+    if use_database:
+        try:
+            context_messages = _build_db_context_messages(messages)
+            if context_messages:
+                messages = context_messages + messages
+        except Exception as e:
+            messages = [{"role": "system", "content": f"Note: database retrieval failed: {str(e)}"}] + messages
 
     # Route based on provider or model name
     if provider == "gemini" or model.lower().startswith("gemini"):
@@ -153,4 +174,172 @@ def list_models() -> Dict[str, Any]:
         }
     ]
     return {"models": models}
+
+
+# ---- Database helpers (optional) ----
+def _safe_import_db():
+    """Import SessionLocal and Product whether running from repo root or backend dir."""
+    try:
+        from database.database import SessionLocal, Product  # type: ignore
+        return SessionLocal, Product
+    except ImportError:
+        import sys
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        if base_dir not in sys.path:
+            sys.path.append(base_dir)
+        from database.database import SessionLocal, Product  # type: ignore
+        return SessionLocal, Product
+
+
+def _build_db_context_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    print("\n=== DATABASE QUERY DEBUG ===")
+    SessionLocal, Product = _safe_import_db()
+    db = SessionLocal()
+    try:
+        user_texts = [m.get("content", "") for m in messages if m.get("role") == "user"]
+        last_query = (user_texts[-1] if user_texts else "").lower()
+        print(f"User's last query: '{last_query}'")
+        
+        if not last_query:
+            print("No user query found")
+            return []
+
+        # Let the LLM decide what to query
+        # First, ask it to generate SQL constraints
+        import json
+        
+        # Use a simple prompt to get structured query parameters
+        analysis_prompt = f"""Given this user question about a product database: "{last_query}"
+
+The database has a 'products' table with columns: name, category, price, description, stock
+
+Generate a JSON object with these optional filters:
+- "category_keywords": list of category/product type keywords to search for (e.g., ["graphics card", "gpu"])
+- "min_price": minimum price (number or null)
+- "max_price": maximum price (number or null)  
+- "search_terms": list of important words to search in name/description (or empty list for "show all")
+- "limit": how many results to return (default 20, use 50 for "all items" requests)
+
+Respond with ONLY valid JSON, no other text.
+
+Example 1: "show me graphics cards under $200"
+{{"category_keywords": ["graphics card", "gpu"], "max_price": 200, "limit": 20}}
+
+Example 2: "what items cost more than $1000"
+{{"min_price": 1000, "limit": 20}}
+
+Example 3: "show me all items"
+{{"limit": 50}}
+
+Now analyze: "{last_query}" """
+
+        # Get the AI's interpretation
+        # Use Gemini for fast query analysis
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            try:
+                resp = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash-exp:generateContent?key={api_key}",
+                    json={
+                        "contents": [{
+                            "role": "user",
+                            "parts": [{"text": analysis_prompt}]
+                        }]
+                    },
+                    timeout=10
+                )
+                if resp.ok:
+                    data = resp.json()
+                    ai_response = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
+                    # Extract JSON from response (might have markdown code blocks)
+                    ai_response = ai_response.strip()
+                    if "```json" in ai_response:
+                        ai_response = ai_response.split("```json")[1].split("```")[0].strip()
+                    elif "```" in ai_response:
+                        ai_response = ai_response.split("```")[1].split("```")[0].strip()
+                    
+                    query_params = json.loads(ai_response)
+                    print(f"AI interpreted query as: {query_params}")
+                else:
+                    print("AI query analysis failed, using fallback")
+                    query_params = {"limit": 20}
+            except Exception as e:
+                print(f"Error in AI query analysis: {e}")
+                query_params = {"limit": 20}
+        else:
+            # Fallback if no Gemini API
+            query_params = {"limit": 20}
+
+        # Build query from AI's interpretation
+        from sqlalchemy import or_, and_
+        
+        filters = []
+        
+        # Category filter
+        category_keywords = query_params.get("category_keywords", [])
+        if category_keywords:
+            category_filters = []
+            for keyword in category_keywords:
+                category_filters.append(Product.category.ilike(f"%{keyword}%"))
+                category_filters.append(Product.name.ilike(f"%{keyword}%"))
+            filters.append(or_(*category_filters))
+        
+        # Search terms
+        search_terms = query_params.get("search_terms", [])
+        if search_terms:
+            search_filters = []
+            for term in search_terms:
+                search_filters.append(Product.name.ilike(f"%{term}%"))
+                search_filters.append(Product.description.ilike(f"%{term}%"))
+            filters.append(or_(*search_filters))
+        
+        # Price filters
+        min_price = query_params.get("min_price")
+        max_price = query_params.get("max_price")
+        if min_price is not None:
+            filters.append(Product.price >= min_price)
+        if max_price is not None:
+            filters.append(Product.price <= max_price)
+        
+        # Build query
+        query = db.query(Product)
+        if filters:
+            query = query.filter(and_(*filters))
+        
+        # Order by price if filtered
+        if min_price is not None:
+            query = query.order_by(Product.price.asc())
+        elif max_price is not None:
+            query = query.order_by(Product.price.asc())
+        
+        limit = query_params.get("limit", 20)
+        results = query.limit(limit).all()
+        
+        print(f"SQL Query: {query}")
+        print(f"Query returned {len(results)} products (limit: {limit})")
+        
+        if not results:
+            return [{
+                "role": "system",
+                "content": "DATABASE: No products found matching those criteria."
+            }]
+        
+        # Build simple, clear context
+        total_in_db = db.query(Product).count()
+        
+        context = f"DATABASE RESULTS: Found {len(results)} products (total in database: {total_in_db})\n\n"
+        for p in results:
+            context += f"- {p.name} | Category: {p.category} | Price: ${p.price} | Stock: {p.stock}\n"
+        
+        return [{
+            "role": "system",
+            "content": context
+        }]
+        
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
 
